@@ -185,96 +185,76 @@ def organize_visits(df, min_size=12, max_size=15, seed_trials=50):
         df["LONGITUD"] = df["LATITUD"]
         df["LATITUD"] = original_lon
 
-    # Validación después de la posible corrección.
+    # Las visitas sin coordenadas NO bloquean el proceso.
     valid = (
         df["LATITUD"].between(-90, 90)
         & df["LONGITUD"].between(-180, 180)
         & df["LATITUD"].notna()
         & df["LONGITUD"].notna()
     )
-
+    missing_coords = df.loc[~valid].copy()
+    geo_df = df.loc[valid].copy()
     invalid_count = int((~valid).sum())
-    if invalid_count:
-        raise ValueError(
-            f"Hay {invalid_count} registros con coordenadas inválidas o vacías."
-        )
 
-    n = len(df)
+    # Si ninguna visita tiene GPS, todo se deja en un paquete especial.
+    if len(geo_df) == 0:
+        result = df.copy()
+        result["PAQUETE"] = 1
+        result["ORDEN"] = range(1, len(result) + 1)
+        result["OBSERVACION"] = "REVISAR: SIN COORDENADAS"
+        summary_df = pd.DataFrame([{
+            "PAQUETE": 1,
+            "VISITAS": len(result),
+            "MUNICIPIOS": " | ".join(sorted(result["MUNICIPIO"].fillna("").astype(str).unique())),
+            "DISTANCIA_PROMEDIO_KM": 0,
+            "DISTANCIA_MAXIMA_KM": 0,
+            "LATITUD_CENTRO": "",
+            "LONGITUD_CENTRO": "",
+            "ESTADO": "REVISAR",
+            "ADVERTENCIA_DISTANCIA": "SIN COORDENADAS"
+        }])
+        control = pd.DataFrame({
+            "CONTROL": ["TOTAL VISITAS", "VISITAS CON GPS", "VISITAS SIN GPS", "PAQUETES GEOGRÁFICOS", "PAQUETE ESPECIAL SIN COORDENADAS", "COORDENADAS INVERTIDAS DETECTADAS"],
+            "VALOR": [len(df), 0, invalid_count, 0, 1, "SÍ" if swapped else "NO"]
+        })
+        return result, summary_df, control, swapped
+
+    n = len(geo_df)
     k, sizes = choose_package_count(n, min_size, max_size)
-
     if k is None or k == 0:
-        raise ValueError("No hay visitas válidas para organizar.")
+        raise ValueError("No hay visitas con coordenadas suficientes para organizar.")
 
-    coords = df[["LATITUD", "LONGITUD"]].to_numpy(dtype=float)
-    labels, centers = balanced_geographical_clustering(
-        coords, sizes, seed_trials=seed_trials
-    )
+    coords = geo_df[["LATITUD", "LONGITUD"]].to_numpy(dtype=float)
+    labels, centers = balanced_geographical_clustering(coords, sizes, seed_trials=seed_trials)
 
-    # Orden geográfico estable de paquetes:
-    # norte a sur y, dentro de la misma franja, oeste a este.
-    package_order = sorted(
-        range(k),
-        key=lambda p: (centers[p, 0], centers[p, 1])
-    )
-    package_map = {
-        old: new + 1
-        for new, old in enumerate(package_order)
-    }
+    package_order = sorted(range(k), key=lambda p: (centers[p, 0], centers[p, 1]))
+    package_map = {old: new + 1 for new, old in enumerate(package_order)}
+    geo_df["PAQUETE"] = [package_map[int(x)] for x in labels]
+    geo_df["OBSERVACION"] = ""
 
-    df["PAQUETE"] = [package_map[int(x)] for x in labels]
-
-    # Orden interno: distancia al centroide.
     package_centers = {}
-    for p in range(1, k + 1):
-        pts = df.loc[
-            df["PAQUETE"] == p,
-            ["LATITUD", "LONGITUD"]
-        ].to_numpy(dtype=float)
-        package_centers[p] = pts.mean(axis=0)
+    for pnum in range(1, k + 1):
+        pts = geo_df.loc[geo_df["PAQUETE"] == pnum, ["LATITUD", "LONGITUD"]].to_numpy(dtype=float)
+        package_centers[pnum] = pts.mean(axis=0)
 
     distances = []
-    for _, row in df.iterrows():
+    for _, row in geo_df.iterrows():
         c = package_centers[int(row["PAQUETE"])]
-        distances.append(
-            float(
-                haversine_km(
-                    c,
-                    np.array([[row["LATITUD"], row["LONGITUD"]]])
-                )[0]
-            )
-        )
+        distances.append(float(haversine_km(c, np.array([[row["LATITUD"], row["LONGITUD"]]]))[0]))
 
-    df["_DISTANCIA_CENTRO_KM"] = distances
-    df = df.sort_values(
-        ["PAQUETE", "_DISTANCIA_CENTRO_KM"]
-    ).copy()
+    geo_df["_DISTANCIA_CENTRO_KM"] = distances
+    geo_df = geo_df.sort_values(["PAQUETE", "_DISTANCIA_CENTRO_KM"]).copy()
+    geo_df.insert(1, "ORDEN", geo_df.groupby("PAQUETE").cumcount() + 1)
 
-    df.insert(
-        1,
-        "ORDEN",
-        df.groupby("PAQUETE").cumcount() + 1
-    )
-
-    # Resumen de calidad.
     summary = []
-    for p in range(1, k + 1):
-        sub = df[df["PAQUETE"] == p]
-        c = package_centers[p]
+    for pnum in range(1, k + 1):
+        sub = geo_df[geo_df["PAQUETE"] == pnum]
+        c = package_centers[pnum]
         d = sub["_DISTANCIA_CENTRO_KM"].to_numpy(dtype=float)
-
         summary.append({
-            "PAQUETE": p,
+            "PAQUETE": pnum,
             "VISITAS": len(sub),
-            "MUNICIPIOS": " | ".join(
-                sorted(
-                    sub["MUNICIPIO"]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    .replace("", "SIN MUNICIPIO")
-                    .unique()
-                )
-            ),
+            "MUNICIPIOS": " | ".join(sorted(sub["MUNICIPIO"].fillna("").astype(str).str.strip().replace("", "SIN MUNICIPIO").unique())),
             "DISTANCIA_PROMEDIO_KM": round(float(d.mean()), 3),
             "DISTANCIA_MAXIMA_KM": round(float(d.max()), 3),
             "LATITUD_CENTRO": round(float(c[0]), 6),
@@ -282,51 +262,35 @@ def organize_visits(df, min_size=12, max_size=15, seed_trials=50):
         })
 
     summary_df = pd.DataFrame(summary)
+    summary_df["ESTADO"] = np.where(summary_df["VISITAS"] < min_size, "REDUCIDO", np.where(summary_df["VISITAS"] > max_size, "GRANDE", "NORMAL"))
+    summary_df["ADVERTENCIA_DISTANCIA"] = np.where(summary_df["DISTANCIA_MAXIMA_KM"] >= 5, "REVISAR DESPLAZAMIENTO", "")
 
-    # Clasificación operativa:
-    # NORMAL = dentro del objetivo
-    # REDUCIDO = menos del mínimo
-    # GRANDE = mayor del máximo
-    summary_df["ESTADO"] = np.where(
-        summary_df["VISITAS"] < min_size,
-        "REDUCIDO",
-        np.where(
-            summary_df["VISITAS"] > max_size,
-            "GRANDE",
-            "NORMAL"
-        )
-    )
-
-    # Advertencia adicional para grupos geográficamente dispersos.
-    # El umbral es configurable en el código y sirve como señal operativa,
-    # no como bloqueo.
-    summary_df["ADVERTENCIA_DISTANCIA"] = np.where(
-        summary_df["DISTANCIA_MAXIMA_KM"] >= 5,
-        "REVISAR DESPLAZAMIENTO",
-        ""
-    )
+    # Todas las visitas sin coordenadas se agrupan juntas en un paquete especial.
+    if invalid_count:
+        special_package = k + 1
+        missing_coords["PAQUETE"] = special_package
+        missing_coords["ORDEN"] = range(1, len(missing_coords) + 1)
+        missing_coords["OBSERVACION"] = "REVISAR: SIN COORDENADAS"
+        missing_coords["_DISTANCIA_CENTRO_KM"] = 0
+        summary_df = pd.concat([summary_df, pd.DataFrame([{
+            "PAQUETE": special_package,
+            "VISITAS": len(missing_coords),
+            "MUNICIPIOS": " | ".join(sorted(missing_coords["MUNICIPIO"].fillna("").astype(str).str.strip().replace("", "SIN MUNICIPIO").unique())),
+            "DISTANCIA_PROMEDIO_KM": 0,
+            "DISTANCIA_MAXIMA_KM": 0,
+            "LATITUD_CENTRO": "",
+            "LONGITUD_CENTRO": "",
+            "ESTADO": "REVISAR",
+            "ADVERTENCIA_DISTANCIA": "SIN COORDENADAS"
+        }])], ignore_index=True)
+        result = pd.concat([geo_df.drop(columns=["_DISTANCIA_CENTRO_KM"]), missing_coords], ignore_index=True)
+    else:
+        result = geo_df.drop(columns=["_DISTANCIA_CENTRO_KM"])
 
     control = pd.DataFrame({
-        "CONTROL": [
-            "TOTAL VISITAS",
-            "PAQUETES GENERADOS",
-            "TAMAÑO MÍNIMO",
-            "TAMAÑO MÁXIMO",
-            "COORDENADAS INVERTIDAS DETECTADAS",
-            "COORDENADAS INVÁLIDAS"
-        ],
-        "VALOR": [
-            len(df),
-            k,
-            int(summary_df["VISITAS"].min()),
-            int(summary_df["VISITAS"].max()),
-            "SÍ" if swapped else "NO",
-            0
-        ]
+        "CONTROL": ["TOTAL VISITAS", "VISITAS CON GPS", "VISITAS SIN GPS", "PAQUETES GEOGRÁFICOS", "PAQUETE ESPECIAL SIN COORDENADAS", "TAMAÑO MÍNIMO OBJETIVO", "TAMAÑO MÁXIMO OBJETIVO", "COORDENADAS INVERTIDAS DETECTADAS"],
+        "VALOR": [len(df), len(geo_df), invalid_count, k, (k + 1 if invalid_count else "NO"), min_size, max_size, "SÍ" if swapped else "NO"]
     })
-
-    result = df.drop(columns=["_DISTANCIA_CENTRO_KM"])
-
     return result, summary_df, control, swapped
 
 def excel_bytes(result, summary, control):
@@ -469,6 +433,15 @@ if "result" in st.session_state:
         st.warning(
             f"Revisar desplazamiento en paquete(s): {paquetes}. "
             "La distancia máxima al centroide es elevada."
+        )
+
+    missing_rows = summary[summary["ADVERTENCIA_DISTANCIA"] == "SIN COORDENADAS"]
+    if len(missing_rows):
+        pnum = int(missing_rows.iloc[0]["PAQUETE"])
+        nmissing = int(missing_rows.iloc[0]["VISITAS"])
+        st.error(
+            f"⚠️ Paquete {pnum}: {nmissing} visita(s) sin coordenadas. "
+            "Revisar antes de programar el desplazamiento."
         )
 
     st.subheader("Visitas organizadas")
