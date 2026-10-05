@@ -23,7 +23,7 @@ REQUIRED_COLUMNS = [
 # - Un municipio nunca se mezcla con otro para completar paquetes.
 # - Se aumenta el número de paquetes dentro de un municipio cuando
 #   eso reduce la dispersión máxima.
-TARGET_MAX_RADIUS_KM = 10.0
+TARGET_MAX_RADIUS_KM = 17.0
 WARNING_RADIUS_KM = 17.0
 
 
