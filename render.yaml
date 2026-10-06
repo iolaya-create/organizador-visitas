@@ -1,10 +1,6 @@
 services:
   - type: web
     name: organizador-visitas
-    runtime: python
-    plan: free
+    env: python
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
-    envVars:
-      - key: APP_PASSWORD
-        sync: false

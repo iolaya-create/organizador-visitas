@@ -198,7 +198,8 @@ def geographic_priority_clustering(
     min_size=12,
     max_size=15,
     seed_trials=50,
-    target_radius=TARGET_MAX_RADIUS_KM
+    target_radius=TARGET_MAX_RADIUS_KM,
+    requested_k=None
 ):
     """
     V6:
@@ -217,6 +218,23 @@ def geographic_priority_clustering(
 
     if n == 0:
         return np.array([], dtype=int), np.empty((0, 2)), 0
+
+    if requested_k is not None:
+        k = int(requested_k)
+        if k < 1 or k > n:
+            raise ValueError(f"La cantidad de paquetes solicitada ({k}) no es válida para {n} visitas.")
+
+        # Cuando el usuario define explícitamente la cantidad de paquetes,
+        # respetamos ese número aunque algún paquete quede por debajo del
+        # mínimo o por encima del máximo configurado. La geografía sigue
+        # siendo la prioridad para repartir las visitas.
+        base = n // k
+        rem = n % k
+        sizes = [base + (1 if i < rem else 0) for i in range(k)]
+        labels, centers = balanced_geographical_clustering(
+            coords, sizes, seed_trials=seed_trials
+        )
+        return labels, centers, k
 
     if n <= max_size:
         return np.zeros(n, dtype=int), np.array([coords.mean(axis=0)]), 1
@@ -292,7 +310,8 @@ def organize_visits(
     min_size=12,
     max_size=15,
     seed_trials=50,
-    target_radius=TARGET_MAX_RADIUS_KM
+    target_radius=TARGET_MAX_RADIUS_KM,
+    package_plan=None
 ):
     df = df.copy()
 
@@ -372,12 +391,17 @@ def organize_visits(
         sub = geo_df[geo_df["_MUNICIPIO_KEY"] == municipio].copy()
         coords = sub[["LATITUD", "LONGITUD"]].to_numpy(dtype=float)
 
+        requested_k = None
+        if package_plan is not None:
+            requested_k = package_plan.get(municipio)
+
         labels, centers, k = geographic_priority_clustering(
             coords,
             min_size=min_size,
             max_size=max_size,
             seed_trials=seed_trials,
-            target_radius=target_radius
+            target_radius=target_radius,
+            requested_k=requested_k
         )
 
         # Ordenamos los subpaquetes por centro geográfico.
@@ -852,33 +876,72 @@ def organize_pdfs(uploaded_pdfs, result):
 
 def build_pdf_zip(classified, unmatched):
     """
-    ZIP optimizado:
+    ZIP optimizado para impresión:
       PAQUETE_XX_MUNICIPIO/
-        SOLICITUD.pdf
+        PAQUETE_XX_MUNICIPIO.pdf   <- todas las páginas del paquete en un solo PDF
       DUPLICADOS_PDF/
-        SOLICITUD__ORIGEN__PAG_X.pdf
+        ... PDFs individuales para revisión
       PDF_NO_ENCONTRADOS/
-        ORIGEN__PAG_X.pdf
+        ... PDFs/páginas que no pudieron asignarse
+
+    Cada paquete se construye concatenando sus páginas en el mismo orden
+    en que fueron encontradas en los PDF cargados.
     """
+    from pypdf import PdfReader, PdfWriter
+
     output = io.BytesIO()
+
+    # Agrupar las páginas encontradas por paquete.
+    paquetes = {}
+    duplicados = []
+
+    for item in classified:
+        if item["estado"] == "DUPLICADO PDF":
+            duplicados.append(item)
+            continue
+        paquetes.setdefault(
+            (int(item["paquete"]), safe_filename(item["municipio"], "SIN_MUNICIPIO")),
+            []
+        ).append(item)
+
+    # Orden estable: PDF de origen + número de página.
+    for items in paquetes.values():
+        items.sort(key=lambda x: (str(x.get("filename", "")), int(x.get("page_number") or 0)))
 
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as z:
         used_names = set()
 
-        for item in classified:
-            municipio = safe_filename(item["municipio"], "SIN_MUNICIPIO")
+        # Un único PDF por paquete, con todas sus hojas.
+        for (paquete, municipio), items in sorted(paquetes.items()):
+            writer = PdfWriter()
+            for item in items:
+                try:
+                    reader = PdfReader(io.BytesIO(item["pdf_bytes"]))
+                    for page in reader.pages:
+                        writer.add_page(page)
+                except Exception as e:
+                    # Si una página no puede reconstruirse, se conserva abajo
+                    # como archivo individual para no perderla.
+                    item = dict(item)
+                    item["merge_error"] = str(e)
+                    unmatched.append(item)
+
+            if len(writer.pages):
+                buffer = io.BytesIO()
+                writer.write(buffer)
+                folder = f"PAQUETE_{paquete:02d}_{municipio}"
+                filename = f"PAQUETE_{paquete:02d}_{municipio}.pdf"
+                path = unique_zip_path(used_names, folder, filename)
+                z.writestr(path, buffer.getvalue())
+
+        # Los duplicados se mantienen separados para revisión.
+        for item in duplicados:
             solicitud = safe_filename(item["solicitud"], "SIN_SOLICITUD")
-            folder = f"PAQUETE_{int(item['paquete']):02d}_{municipio}"
-
-            if item["estado"] == "DUPLICADO PDF":
-                folder = "DUPLICADOS_PDF"
-                base = f"{solicitud}__{Path(item['filename']).stem}__PAG_{item['page_number']}.pdf"
-            else:
-                base = f"{solicitud}.pdf"
-
-            path = unique_zip_path(used_names, folder, base)
+            base = f"{solicitud}__{Path(item['filename']).stem}__PAG_{item['page_number']}.pdf"
+            path = unique_zip_path(used_names, "DUPLICADOS_PDF", base)
             z.writestr(path, item["pdf_bytes"])
 
+        # No encontrados / errores: conservar cada página individual.
         for item in unmatched:
             source = safe_filename(Path(item["filename"]).stem, "PDF")
             page = item.get("page_number")
@@ -1027,7 +1090,7 @@ def excel_bytes(result, summary, control):
 # INTERFAZ
 # ============================================================
 
-st.title("📍 Organizador de Visitas — V12")
+st.title("📍 Organizador de Visitas — V15")
 
 st.write(
     "Carga un Excel y el aplicativo organizará las visitas por proximidad "
@@ -1074,7 +1137,7 @@ with st.sidebar:
         help="Más pruebas pueden encontrar agrupaciones más compactas, pero tardan más."
     )
 
-    st.caption("V7: municipio primero + distancia primero. Módulo PDF V12: procesa página por página y soporta PDF consolidados.")
+    st.caption("V15: cantidad de paquetes configurable por municipio + PDF acumulados por tandas + PDF consolidado por paquete.")
 
 uploaded = st.file_uploader(
     "Sube el archivo Excel",
@@ -1082,12 +1145,49 @@ uploaded = st.file_uploader(
     help="Columnas requeridas: CUENTA, SOLICITUD, MUNICIPIO, DIRECCION, LONGITUD, LATITUD"
 )
 
-pdfs_uploaded = st.file_uploader(
-    "📄 Sube los PDF de las órdenes",
-    type=["pdf"],
-    accept_multiple_files=True,
-    help="El cruce se hace por SOLICITUD exacta, página por página."
-)
+# ------------------------------------------------------------
+# Carga de PDF por tandas
+# ------------------------------------------------------------
+if "pdf_batch_version" not in st.session_state:
+    st.session_state.pdf_batch_version = 0
+if "pdf_batch_count" not in st.session_state:
+    st.session_state.pdf_batch_count = 1
+
+pdfs_uploaded = []
+for batch_idx in range(st.session_state.pdf_batch_count):
+    label = (
+        "📄 Selecciona los PDF de las órdenes"
+        if batch_idx == 0
+        else f"📄 Agrega otra tanda de PDF — lote {batch_idx + 1}"
+    )
+    batch_files = st.file_uploader(
+        label,
+        type=["pdf"],
+        accept_multiple_files=True,
+        key=f"pdf_batch_{st.session_state.pdf_batch_version}_{batch_idx}",
+        help="Puedes cargar PDF de una carpeta y luego agregar otra tanda de otra carpeta. Todo se acumula antes del cruce."
+    )
+    if batch_files:
+        pdfs_uploaded.extend(batch_files)
+
+b_pdf_1, b_pdf_2 = st.columns([1, 1])
+with b_pdf_1:
+    if st.button("➕ Agregar otra tanda de PDF", use_container_width=True):
+        st.session_state.pdf_batch_count += 1
+        st.rerun()
+with b_pdf_2:
+    if st.button("🗑️ Reiniciar carga de PDF", use_container_width=True):
+        st.session_state.pdf_batch_version += 1
+        st.session_state.pdf_batch_count = 1
+        for key in [
+            "pdf_control", "pdf_classified", "pdf_unmatched",
+            "pdf_duplicates", "pdf_stats", "pdf_signature"
+        ]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+if pdfs_uploaded:
+    st.caption(f"📚 {len(pdfs_uploaded)} archivo(s) PDF acumulado(s) en {sum(1 for i in range(st.session_state.pdf_batch_count) if st.session_state.get(f'pdf_batch_{st.session_state.pdf_batch_version}_{i}'))} tanda(s).")
 
 # Evita mostrar resultados PDF de una carga anterior cuando el usuario
 # reemplaza el Excel o los documentos.
@@ -1107,7 +1207,10 @@ if excel_signature and st.session_state.get("excel_signature") != excel_signatur
 pdf_signature = None
 if pdfs_uploaded:
     pdf_signature = tuple(
-        sorted((f.name, len(f.getvalue())) for f in pdfs_uploaded)
+        sorted(
+            (f.name, len(f.getvalue()), hashlib.sha1(f.getvalue()).hexdigest())
+            for f in pdfs_uploaded
+        )
     )
 
 if pdf_signature and st.session_state.get("pdf_signature") != pdf_signature:
@@ -1137,6 +1240,73 @@ if uploaded:
 
         st.write(f"**Registros detectados:** {len(df)}")
 
+        # ====================================================
+        # CONFIGURACIÓN MANUAL DE CANTIDAD DE PAQUETES
+        # ====================================================
+        st.subheader("📦 Cantidad de paquetes por municipio")
+        st.caption(
+            "Si no activas esta opción, el sistema mantiene la lógica automática. "
+            "Si la activas, tú decides cuántos paquetes crear en cada municipio "
+            "y el sistema conserva la distribución geográfica dentro de esa cantidad."
+        )
+
+        manual_packages = st.checkbox(
+            "Quiero definir manualmente la cantidad de paquetes por municipio",
+            value=st.session_state.get("manual_packages", False),
+            key="manual_packages"
+        )
+
+        package_plan = {}
+        if manual_packages:
+            temp_coords = df.copy()
+            for col in ["LATITUD", "LONGITUD"]:
+                temp_coords[col] = pd.to_numeric(temp_coords[col], errors="coerce")
+
+            # Aplicamos la misma detección de inversión para que el conteo
+            # de visitas con GPS sea consistente con la organización final.
+            if detect_swapped_coordinates(temp_coords):
+                original_lon = temp_coords["LONGITUD"].copy()
+                temp_coords["LONGITUD"] = temp_coords["LATITUD"]
+                temp_coords["LATITUD"] = original_lon
+
+            valid_preview = (
+                temp_coords["LATITUD"].between(-90, 90)
+                & temp_coords["LONGITUD"].between(-180, 180)
+                & temp_coords["LATITUD"].notna()
+                & temp_coords["LONGITUD"].notna()
+                & (temp_coords["LATITUD"] != 0)
+                & (temp_coords["LONGITUD"] != 0)
+            )
+            temp_coords = temp_coords.loc[valid_preview].copy()
+            temp_coords["_MUNICIPIO_KEY"] = (
+                temp_coords["MUNICIPIO"].fillna("SIN MUNICIPIO").astype(str).str.strip()
+                .replace("", "SIN MUNICIPIO")
+            )
+
+            municipalities = sorted(temp_coords["_MUNICIPIO_KEY"].unique())
+            if municipalities:
+                st.write("Selecciona la cantidad de paquetes que quieres para cada municipio:")
+                for municipio in municipalities:
+                    n_visitas = int((temp_coords["_MUNICIPIO_KEY"] == municipio).sum())
+                    default_k = max(1, int(np.ceil(n_visitas / max_size)))
+                    selected_k = st.number_input(
+                        f"{municipio} — {n_visitas} visitas",
+                        min_value=1,
+                        max_value=n_visitas,
+                        value=min(default_k, n_visitas),
+                        step=1,
+                        key=f"package_count_{municipio}"
+                    )
+                    package_plan[municipio] = int(selected_k)
+
+                st.info(
+                    "La cantidad indicada se respeta. Por ejemplo, 20 visitas de Acacías "
+                    "pueden quedar en 2 paquetes de aproximadamente 10 visitas cada uno. "
+                    "La distribución interna sigue priorizando la cercanía geográfica."
+                )
+            else:
+                st.warning("No hay visitas con coordenadas válidas para configurar paquetes por municipio.")
+
         if st.button("🚀 Organizar visitas", type="primary"):
             with st.spinner("Analizando coordenadas y formando paquetes geográficos..."):
                 try:
@@ -1145,7 +1315,8 @@ if uploaded:
                         min_size=int(min_size),
                         max_size=int(max_size),
                         seed_trials=int(seed_trials),
-                        target_radius=float(target_radius)
+                        target_radius=float(target_radius),
+                        package_plan=package_plan if manual_packages else None
                     )
 
                     st.session_state.result = result
@@ -1173,8 +1344,9 @@ if "result" in st.session_state:
     if pdfs_uploaded:
         st.subheader("📄 Cruce de órdenes PDF")
         st.caption(
-            "Puedes subir órdenes individuales o PDF consolidados. "
-            "El sistema analiza cada página y usa SOLICITUD como llave exacta."
+            "Puedes cargar PDF individuales o consolidados desde varias carpetas, "
+            "en diferentes tandas. Todo se acumula y el sistema analiza cada página "
+            "usando SOLICITUD como llave exacta."
         )
 
         if st.button("🔗 Cruzar PDF con las visitas", type="secondary"):
