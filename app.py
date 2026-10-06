@@ -1,6 +1,7 @@
 import io
 import re
 import zipfile
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -528,7 +529,7 @@ def extract_solicitud_from_pdf(pdf_bytes):
         text = "\n".join(pages)
     except Exception as e:
         raise RuntimeError(
-            "No se pudo leer el PDF. Verifica que sea un PDF con texto."
+            f"No se pudo leer el PDF: {type(e).__name__}: {e}"
         ) from e
 
     # Primero buscamos expresamente "Número solicitud".
