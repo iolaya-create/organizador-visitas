@@ -1,6 +1,7 @@
 import io
 import re
 import zipfile
+import hashlib
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -508,84 +509,20 @@ def organize_visits(
 
 
 
-def extract_solicitud_from_pdf(pdf_bytes, valid_solicitudes=None):
-    """
-    Extrae la SOLICITUD de una orden PDF.
-
-    Las SOLICITUD válidas del Excel son normalmente de 6 dígitos. Para evitar
-    capturar números de cuenta, identificación, teléfono, etc., se prioriza
-    cualquier número de 6 dígitos que aparezca inmediatamente después de
-    "Número solicitud". Si se entrega valid_solicitudes, se prefiere además
-    el candidato que exista realmente en el Excel.
-    """
-    text = ""
-
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = []
-        for page in reader.pages:
-            try:
-                pages.append(page.extract_text() or "")
-            except Exception:
-                pass
-        text = "\n".join(pages)
-    except Exception as e:
-        raise RuntimeError(
-            f"No se pudo leer el PDF: {type(e).__name__}: {e}"
-        ) from e
-
-    valid = {normalize_solicitud(x) for x in (valid_solicitudes or []) if normalize_solicitud(x)}
-
-    # 1) La fuente principal es el texto inmediatamente asociado al rótulo.
-    label_patterns = [
-        r"N[uú]mero\s+solicitud\s*[:\-]?",
-        r"N[uú]mero\s+de\s+solicitud\s*[:\-]?",
-        r"SOLICITUD\s*[:\-]?",
-    ]
-
-    for label_pattern in label_patterns:
-        for match in re.finditer(label_pattern, text, flags=re.IGNORECASE):
-            # Tomamos una ventana corta después del rótulo para no confundir
-            # la solicitud con números posteriores del formulario.
-            window = text[match.end():match.end() + 120]
-            candidates = re.findall(r"(?<!\d)(\d{6})(?!\d)", window)
-
-            # Si pypdf pegó números contiguos al campo, también probamos
-            # ventanas de 6 dígitos dentro de cadenas numéricas más largas.
-            if not candidates:
-                candidates = re.findall(r"\d{6}", window)
-
-            if valid:
-                for candidate in candidates:
-                    if normalize_solicitud(candidate) in valid:
-                        return normalize_solicitud(candidate), text
-
-            if candidates:
-                return normalize_solicitud(candidates[0]), text
-
-    # 2) Respaldo: buscar cualquier SOLICITUD de 6 dígitos que exista en Excel.
-    all_six = re.findall(r"(?<!\d)(\d{6})(?!\d)", text)
-    if valid:
-        for candidate in all_six:
-            if normalize_solicitud(candidate) in valid:
-                return normalize_solicitud(candidate), text
-
-    if all_six:
-        return normalize_solicitud(all_six[0]), text
-
-    return None, text
-
 def normalize_solicitud(value):
     """
     Normaliza la llave SOLICITUD para que Excel/PDF coincidan aunque
-    Excel la haya leído como número decimal.
+    Excel la haya leído como número decimal o con separadores.
     """
-    if pd.isna(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
 
     s = str(value).strip()
-
     if re.fullmatch(r"\d+\.0+", s):
         s = s.split(".")[0]
 
@@ -593,190 +530,365 @@ def normalize_solicitud(value):
     return digits if digits else s
 
 
+def extract_solicitud_from_text(text, valid_solicitudes=None):
+    """
+    Extrae SOLICITUD de UNA página.
+
+    Los formularios reales pueden ser extraídos por pypdf con el número
+    ANTES del rótulo, por ejemplo:
+        259034Número solicitud:
+    y no como:
+        Número solicitud: 259034
+
+    Por eso se prueban ambas direcciones y, cuando tenemos el Excel, se
+    prioriza siempre una SOLICITUD que exista en él.
+    """
+    text = text or ""
+    valid = {
+        normalize_solicitud(x)
+        for x in (valid_solicitudes or [])
+        if normalize_solicitud(x)
+    }
+
+    labels = r"N[uú]mero\s+(?:de\s+)?solicitud|SOLICITUD"
+
+    # 1) Formato habitual de extracción observado en estos PDFs:
+    #    259034Número solicitud:
+    before = list(re.finditer(
+        rf"(?<!\d)(\d{{4,10}})\s*{labels}\b",
+        text,
+        flags=re.IGNORECASE
+    ))
+    for m in before:
+        candidate = normalize_solicitud(m.group(1))
+        if not valid or candidate in valid:
+            return candidate, "ROTULO_ANTES"
+
+    # 2) Número después del rótulo:
+    after = list(re.finditer(
+        rf"{labels}\s*[:\-]?\s*(\d{{4,10}})",
+        text,
+        flags=re.IGNORECASE
+    ))
+    for m in after:
+        candidate = normalize_solicitud(m.group(1))
+        if not valid or candidate in valid:
+            return candidate, "ROTULO_DESPUES"
+
+    # 3) Algunos extractores separan el número y el rótulo de forma extraña.
+    #    Buscamos números válidos cerca de cualquier rótulo.
+    if valid:
+        valid_candidates = []
+        for m in re.finditer(labels, text, flags=re.IGNORECASE):
+            window_start = max(0, m.start() - 100)
+            window_end = min(len(text), m.end() + 100)
+            window = text[window_start:window_end]
+            for candidate in re.findall(r"(?<!\d)(\d{6})(?!\d)", window):
+                candidate = normalize_solicitud(candidate)
+                if candidate in valid:
+                    distance = abs((window_start + window.find(candidate)) - m.start())
+                    valid_candidates.append((distance, candidate))
+        if valid_candidates:
+            valid_candidates.sort(key=lambda x: x[0])
+            return valid_candidates[0][1], "CANDIDATO_VALIDO_CERCA_ROTULO"
+
+        # 4) Último respaldo: una sola SOLICITUD válida en toda la página.
+        found = []
+        for candidate in re.findall(r"(?<!\d)(\d{6})(?!\d)", text):
+            candidate = normalize_solicitud(candidate)
+            if candidate in valid and candidate not in found:
+                found.append(candidate)
+        if len(found) == 1:
+            return found[0], "CANDIDATO_VALIDO_UNICO"
+        if len(found) > 1:
+            return None, "AMBIGUA"
+
+    # Sin Excel como referencia, solo aceptamos el número pegado al rótulo.
+    # No inventamos una solicitud por cualquier número del formulario.
+    return None, "NO_ENCONTRADA"
+
+
+def extract_pdf_pages(uploaded_file):
+    """
+    Lee un PDF una sola vez y devuelve sus páginas con texto y bytes PDF
+    independientes. Esto permite trabajar tanto con PDFs individuales como
+    con PDFs consolidados (una orden por página).
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    filename = uploaded_file.name
+    pdf_bytes = uploaded_file.getvalue()
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as e:
+        raise RuntimeError(
+            f"No se pudo abrir '{filename}': {type(e).__name__}: {e}"
+        ) from e
+
+    pages = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+
+        writer = PdfWriter()
+        writer.add_page(page)
+        page_buffer = io.BytesIO()
+        writer.write(page_buffer)
+
+        pages.append({
+            "source_pdf": filename,
+            "page_number": page_number,
+            "page_count": len(reader.pages),
+            "text": text,
+            "pdf_bytes": page_buffer.getvalue()
+        })
+
+    return pages
+
+
+def safe_filename(value, default="archivo"):
+    value = re.sub(r"[^A-Za-z0-9ÁÉÍÓÚáéíóúÑñ._ -]", "_", str(value))
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return value or default
+
+
+def unique_zip_path(used_names, folder, filename):
+    filename = safe_filename(filename, "orden.pdf")
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix or ".pdf"
+    candidate = filename
+    counter = 2
+    while f"{folder}/{candidate}" in used_names:
+        candidate = f"{stem}_{counter}{suffix}"
+        counter += 1
+    path = f"{folder}/{candidate}"
+    used_names.add(path)
+    return path
+
+
 def organize_pdfs(uploaded_pdfs, result):
     """
-    Cruza PDFs contra el Excel usando EXCLUSIVAMENTE SOLICITUD.
-    Devuelve:
-      - dataframe de control
-      - lista de archivos clasificados
-      - lista de PDFs no encontrados
+    Cruza PDF POR PÁGINA contra el Excel usando exclusivamente SOLICITUD.
+
+    Soporta:
+      - PDF individual de una orden.
+      - PDF consolidado con muchas órdenes, una por página.
+
+    Cada página se convierte en una orden independiente en el ZIP final.
     """
     lookup = {}
-
     for _, row in result.iterrows():
         key = normalize_solicitud(row.get("SOLICITUD"))
         if key:
             lookup.setdefault(key, []).append(row)
 
     valid_solicitudes = set(lookup.keys())
-
     records = []
     classified = []
     unmatched = []
     duplicates = []
+    seen_solicitudes = set()
+    total_pages = 0
 
     for pdf_file in uploaded_pdfs:
-        pdf_bytes = pdf_file.getvalue()
-        filename = pdf_file.name
-
         try:
-            solicitud, _ = extract_solicitud_from_pdf(pdf_bytes, valid_solicitudes)
+            pages = extract_pdf_pages(pdf_file)
         except Exception as e:
             records.append({
-                "PDF": filename,
+                "PDF_ORIGEN": pdf_file.name,
+                "PAGINA": "",
                 "SOLICITUD": "",
                 "PAQUETE": "",
                 "MUNICIPIO": "",
                 "ESTADO": "ERROR LECTURA PDF",
                 "DETALLE": str(e)
             })
-            unmatched.append((filename, pdf_bytes))
+            unmatched.append({
+                "filename": pdf_file.name,
+                "pdf_bytes": pdf_file.getvalue(),
+                "page_number": None,
+                "reason": "ERROR LECTURA PDF"
+            })
             continue
 
-        if not solicitud:
-            records.append({
-                "PDF": filename,
-                "SOLICITUD": "",
+        total_pages += len(pages)
+
+        for page in pages:
+            solicitud, method = extract_solicitud_from_text(
+                page["text"], valid_solicitudes
+            )
+
+            base = {
+                "PDF_ORIGEN": page["source_pdf"],
+                "PAGINA": page["page_number"],
+                "SOLICITUD": solicitud or "",
                 "PAQUETE": "",
                 "MUNICIPIO": "",
-                "ESTADO": "SOLICITUD NO ENCONTRADA",
-                "DETALLE": "No se encontró Número solicitud dentro del PDF."
+                "ESTADO": "",
+                "DETALLE": ""
+            }
+
+            if not solicitud:
+                base["ESTADO"] = "SOLICITUD NO ENCONTRADA"
+                if method == "AMBIGUA":
+                    base["DETALLE"] = "Hay varias SOLICITUD válidas en la página y no se pudo determinar una única."
+                else:
+                    base["DETALLE"] = "No se encontró una SOLICITUD válida en la página."
+                records.append(base)
+                unmatched.append({
+                    "filename": page["source_pdf"],
+                    "pdf_bytes": page["pdf_bytes"],
+                    "page_number": page["page_number"],
+                    "reason": base["ESTADO"]
+                })
+                continue
+
+            rows = lookup.get(normalize_solicitud(solicitud), [])
+
+            if not rows:
+                base["ESTADO"] = "PDF_NO_ENCONTRADO"
+                base["DETALLE"] = "La SOLICITUD no existe en el Excel."
+                records.append(base)
+                unmatched.append({
+                    "filename": page["source_pdf"],
+                    "pdf_bytes": page["pdf_bytes"],
+                    "page_number": page["page_number"],
+                    "reason": base["ESTADO"]
+                })
+                continue
+
+            if len(rows) > 1:
+                base["ESTADO"] = "SOLICITUD DUPLICADA EN EXCEL"
+                base["DETALLE"] = f"La llave aparece {len(rows)} veces en el Excel."
+                records.append(base)
+                unmatched.append({
+                    "filename": page["source_pdf"],
+                    "pdf_bytes": page["pdf_bytes"],
+                    "page_number": page["page_number"],
+                    "reason": base["ESTADO"]
+                })
+                continue
+
+            row = rows[0]
+            paquete = int(row["PAQUETE"])
+            municipio = str(row.get("MUNICIPIO", ""))
+            key = normalize_solicitud(solicitud)
+
+            if key in seen_solicitudes:
+                estado = "DUPLICADO PDF"
+                detalle = "La misma SOLICITUD ya fue encontrada en otra página/PDF."
+                duplicates.append({
+                    "filename": page["source_pdf"],
+                    "pdf_bytes": page["pdf_bytes"],
+                    "page_number": page["page_number"],
+                    "paquete": paquete,
+                    "municipio": municipio,
+                    "solicitud": key
+                })
+            else:
+                estado = "ENCONTRADO"
+                detalle = f"Detectada por {method}."
+                seen_solicitudes.add(key)
+
+            base.update({
+                "SOLICITUD": key,
+                "PAQUETE": paquete,
+                "MUNICIPIO": municipio,
+                "ESTADO": estado,
+                "DETALLE": detalle
             })
-            unmatched.append((filename, pdf_bytes))
-            continue
+            records.append(base)
 
-        rows = lookup.get(normalize_solicitud(solicitud), [])
-
-        if not rows:
-            records.append({
-                "PDF": filename,
-                "SOLICITUD": solicitud,
-                "PAQUETE": "",
-                "MUNICIPIO": "",
-                "ESTADO": "PDF_NO_ENCONTRADO",
-                "DETALLE": "La SOLICITUD no existe en el Excel."
+            # Los duplicados también se conservan en el ZIP, pero en carpeta
+            # separada para que nunca se pierdan.
+            classified.append({
+                "filename": page["source_pdf"],
+                "pdf_bytes": page["pdf_bytes"],
+                "page_number": page["page_number"],
+                "paquete": paquete,
+                "municipio": municipio,
+                "solicitud": key,
+                "estado": estado
             })
-            unmatched.append((filename, pdf_bytes))
-            continue
 
-        # Una solicitud debería ser única. Si el Excel tiene duplicados,
-        # no elegimos arbitrariamente.
-        if len(rows) > 1:
-            records.append({
-                "PDF": filename,
-                "SOLICITUD": solicitud,
-                "PAQUETE": "",
-                "MUNICIPIO": "",
-                "ESTADO": "SOLICITUD DUPLICADA EN EXCEL",
-                "DETALLE": f"La llave aparece {len(rows)} veces en el Excel."
-            })
-            unmatched.append((filename, pdf_bytes))
-            continue
-
-        row = rows[0]
-        paquete = int(row["PAQUETE"])
-        municipio = str(row.get("MUNICIPIO", ""))
-
-        if any(
-            r["SOLICITUD"] == solicitud and r["ESTADO"] == "ENCONTRADO"
-            for r in records
-        ):
-            estado = "DUPLICADO PDF"
-            duplicates.append((filename, pdf_bytes, paquete, municipio, solicitud))
-        else:
-            estado = "ENCONTRADO"
-
-        records.append({
-            "PDF": filename,
-            "SOLICITUD": solicitud,
-            "PAQUETE": paquete,
-            "MUNICIPIO": municipio,
-            "ESTADO": estado,
-            "DETALLE": ""
-        })
-
-        classified.append(
-            (filename, pdf_bytes, paquete, municipio, solicitud)
-        )
-
-    # También reportamos visitas del Excel que no tienen PDF.
-    pdf_keys = {
-        normalize_solicitud(r["SOLICITUD"])
-        for r in records
-        if r["SOLICITUD"]
-    }
-
+    # Visitas del Excel que no tienen ninguna página PDF encontrada.
     for _, row in result.iterrows():
         key = normalize_solicitud(row.get("SOLICITUD"))
-        if not key:
+        if not key or key in seen_solicitudes:
             continue
-        if key not in pdf_keys:
-            records.append({
-                "PDF": "",
-                "SOLICITUD": key,
-                "PAQUETE": int(row["PAQUETE"]),
-                "MUNICIPIO": str(row.get("MUNICIPIO", "")),
-                "ESTADO": "SIN PDF",
-                "DETALLE": "La visita existe en el Excel pero no se recibió PDF."
-            })
+        records.append({
+            "PDF_ORIGEN": "",
+            "PAGINA": "",
+            "SOLICITUD": key,
+            "PAQUETE": int(row["PAQUETE"]),
+            "MUNICIPIO": str(row.get("MUNICIPIO", "")),
+            "ESTADO": "SIN PDF",
+            "DETALLE": "La visita existe en el Excel pero no se encontró su SOLICITUD en los PDF cargados."
+        })
 
-    control = pd.DataFrame(records)
+    control = pd.DataFrame(records, columns=[
+        "PDF_ORIGEN", "PAGINA", "SOLICITUD", "PAQUETE",
+        "MUNICIPIO", "ESTADO", "DETALLE"
+    ])
 
-    return control, classified, unmatched, duplicates
+    stats = {
+        "total_pdfs": len(uploaded_pdfs),
+        "total_paginas": total_pages,
+        "encontrados": int((control["ESTADO"] == "ENCONTRADO").sum()),
+        "sin_pdf": int((control["ESTADO"] == "SIN PDF").sum()),
+        "no_encontrados": int((control["ESTADO"] == "PDF_NO_ENCONTRADO").sum()),
+        "solicitud_no_encontrada": int((control["ESTADO"] == "SOLICITUD NO ENCONTRADA").sum()),
+        "duplicados": int((control["ESTADO"] == "DUPLICADO PDF").sum()),
+        "errores": int((control["ESTADO"] == "ERROR LECTURA PDF").sum()),
+        "duplicadas_excel": int((control["ESTADO"] == "SOLICITUD DUPLICADA EN EXCEL").sum()),
+    }
+
+    return control, classified, unmatched, duplicates, stats
 
 
 def build_pdf_zip(classified, unmatched):
     """
-    Crea un ZIP:
+    ZIP optimizado:
       PAQUETE_XX_MUNICIPIO/
-        PDF...
-      PDF_NO_ENCONTRADO/
-        PDF...
+        SOLICITUD.pdf
+      DUPLICADOS_PDF/
+        SOLICITUD__ORIGEN__PAG_X.pdf
+      PDF_NO_ENCONTRADOS/
+        ORIGEN__PAG_X.pdf
     """
     output = io.BytesIO()
 
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as z:
         used_names = set()
 
-        for filename, pdf_bytes, paquete, municipio, solicitud in classified:
-            safe_municipio = re.sub(
-                r"[^A-Za-z0-9ÁÉÍÓÚáéíóúÑñ _-]",
-                "_",
-                str(municipio)
-            ).strip() or "SIN_MUNICIPIO"
+        for item in classified:
+            municipio = safe_filename(item["municipio"], "SIN_MUNICIPIO")
+            solicitud = safe_filename(item["solicitud"], "SIN_SOLICITUD")
+            folder = f"PAQUETE_{int(item['paquete']):02d}_{municipio}"
 
-            folder = f"PAQUETE_{paquete:02d}_{safe_municipio}"
+            if item["estado"] == "DUPLICADO PDF":
+                folder = "DUPLICADOS_PDF"
+                base = f"{solicitud}__{Path(item['filename']).stem}__PAG_{item['page_number']}.pdf"
+            else:
+                base = f"{solicitud}.pdf"
 
-            # Evitar sobrescritura si llegan dos PDFs con el mismo nombre.
-            candidate = filename
-            stem = Path(filename).stem
-            suffix = Path(filename).suffix or ".pdf"
-            counter = 2
+            path = unique_zip_path(used_names, folder, base)
+            z.writestr(path, item["pdf_bytes"])
 
-            while f"{folder}/{candidate}" in used_names:
-                candidate = f"{stem}_{counter}{suffix}"
-                counter += 1
-
-            path = f"{folder}/{candidate}"
-            used_names.add(path)
-            z.writestr(path, pdf_bytes)
-
-        for filename, pdf_bytes in unmatched:
-            candidate = filename
-            stem = Path(filename).stem
-            suffix = Path(filename).suffix or ".pdf"
-            counter = 2
-
-            while f"PDF_NO_ENCONTRADO/{candidate}" in used_names:
-                candidate = f"{stem}_{counter}{suffix}"
-                counter += 1
-
-            path = f"PDF_NO_ENCONTRADO/{candidate}"
-            used_names.add(path)
-            z.writestr(path, pdf_bytes)
+        for item in unmatched:
+            source = safe_filename(Path(item["filename"]).stem, "PDF")
+            page = item.get("page_number")
+            if page:
+                base = f"{source}__PAG_{page}.pdf"
+            else:
+                base = f"{source}.pdf"
+            path = unique_zip_path(used_names, "PDF_NO_ENCONTRADOS", base)
+            z.writestr(path, item["pdf_bytes"])
 
     return output.getvalue()
-
 
 
 def excel_bytes(result, summary, control):
@@ -802,7 +914,7 @@ def excel_bytes(result, summary, control):
 # INTERFAZ
 # ============================================================
 
-st.title("📍 Organizador de Visitas — V11")
+st.title("📍 Organizador de Visitas — V12")
 
 st.write(
     "Carga un Excel y el aplicativo organizará las visitas por proximidad "
@@ -849,7 +961,7 @@ with st.sidebar:
         help="Más pruebas pueden encontrar agrupaciones más compactas, pero tardan más."
     )
 
-    st.caption("V6: municipio primero + distancia primero.")
+    st.caption("V7: municipio primero + distancia primero. Módulo PDF V12: procesa página por página y soporta PDF consolidados.")
 
 uploaded = st.file_uploader(
     "Sube el archivo Excel",
@@ -861,8 +973,37 @@ pdfs_uploaded = st.file_uploader(
     "📄 Sube los PDF de las órdenes",
     type=["pdf"],
     accept_multiple_files=True,
-    help="El cruce se hace exclusivamente por SOLICITUD."
+    help="El cruce se hace por SOLICITUD exacta, página por página."
 )
+
+# Evita mostrar resultados PDF de una carga anterior cuando el usuario
+# reemplaza el Excel o los documentos.
+excel_signature = None
+if uploaded is not None:
+    excel_signature = hashlib.sha1(uploaded.getvalue()).hexdigest()
+
+if excel_signature and st.session_state.get("excel_signature") != excel_signature:
+    for key in [
+        "result", "summary", "control", "swapped",
+        "pdf_control", "pdf_classified", "pdf_unmatched",
+        "pdf_duplicates", "pdf_stats"
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state.excel_signature = excel_signature
+
+pdf_signature = None
+if pdfs_uploaded:
+    pdf_signature = tuple(
+        sorted((f.name, len(f.getvalue())) for f in pdfs_uploaded)
+    )
+
+if pdf_signature and st.session_state.get("pdf_signature") != pdf_signature:
+    for key in [
+        "pdf_control", "pdf_classified", "pdf_unmatched",
+        "pdf_duplicates", "pdf_stats"
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state.pdf_signature = pdf_signature
 
 if uploaded:
     try:
@@ -899,7 +1040,7 @@ if uploaded:
                     st.session_state.control = control
                     st.session_state.swapped = swapped
 
-                    st.success("Organización V6 completada.")
+                    st.success("Organización geográfica completada.")
 
                 except Exception as e:
                     st.error(f"No se pudo organizar el archivo: {e}")
@@ -914,25 +1055,35 @@ if "result" in st.session_state:
     control = st.session_state.control
 
     # ========================================================
-    # MÓDULO PDF — llave SOLICITUD
+    # MÓDULO PDF V12 — llave SOLICITUD, página por página
     # ========================================================
     if pdfs_uploaded:
         st.subheader("📄 Cruce de órdenes PDF")
+        st.caption(
+            "Puedes subir órdenes individuales o PDF consolidados. "
+            "El sistema analiza cada página y usa SOLICITUD como llave exacta."
+        )
 
-        if st.button("🔗 Cruzar PDF con las visitas"):
-            with st.spinner("Leyendo SOLICITUD de cada PDF y asignándolo a su paquete..."):
+        if st.button("🔗 Cruzar PDF con las visitas", type="secondary"):
+            with st.spinner("Analizando PDFs página por página y asignando cada orden a su paquete..."):
                 try:
-                    pdf_control, classified, unmatched, duplicates = organize_pdfs(
-                        pdfs_uploaded, result
-                    )
+                    (
+                        pdf_control,
+                        classified,
+                        unmatched,
+                        duplicates,
+                        pdf_stats,
+                    ) = organize_pdfs(pdfs_uploaded, result)
 
                     st.session_state.pdf_control = pdf_control
                     st.session_state.pdf_classified = classified
                     st.session_state.pdf_unmatched = unmatched
                     st.session_state.pdf_duplicates = duplicates
+                    st.session_state.pdf_stats = pdf_stats
 
                     st.success(
-                        f"Proceso terminado: {len(pdfs_uploaded)} PDF analizados."
+                        f"Proceso terminado: {pdf_stats['total_pdfs']} PDF analizados, "
+                        f"{pdf_stats['total_paginas']} páginas procesadas."
                     )
                 except Exception as e:
                     st.error(f"No se pudieron procesar los PDF: {e}")
@@ -941,27 +1092,31 @@ if "result" in st.session_state:
         pdf_control = st.session_state.pdf_control
         classified = st.session_state.pdf_classified
         unmatched = st.session_state.pdf_unmatched
+        pdf_stats = st.session_state.get("pdf_stats", {})
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Órdenes encontradas", pdf_stats.get("encontrados", 0))
+        p2.metric("Visitas sin PDF", pdf_stats.get("sin_pdf", 0))
+        p3.metric("PDF/SOLICITUD no encontrada", pdf_stats.get("no_encontrados", 0))
+        p4.metric("Duplicados", pdf_stats.get("duplicados", 0))
+
+        st.caption(
+            f"{pdf_stats.get('total_pdfs', 0)} archivo(s) PDF → "
+            f"{pdf_stats.get('total_paginas', 0)} página(s) procesada(s)."
+        )
 
         st.dataframe(pdf_control, use_container_width=True)
 
-        found = int(
-            (pdf_control["ESTADO"] == "ENCONTRADO").sum()
+        extra_errors = (
+            pdf_stats.get("solicitud_no_encontrada", 0)
+            + pdf_stats.get("errores", 0)
+            + pdf_stats.get("duplicadas_excel", 0)
         )
-        no_pdf = int(
-            (pdf_control["ESTADO"] == "SIN PDF").sum()
-        )
-        not_found = int(
-            (pdf_control["ESTADO"] == "PDF_NO_ENCONTRADO").sum()
-        )
-        duplicate_pdf = int(
-            (pdf_control["ESTADO"] == "DUPLICADO PDF").sum()
-        )
-
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("PDF encontrados", found)
-        p2.metric("Visitas sin PDF", no_pdf)
-        p3.metric("PDF sin solicitud en Excel", not_found)
-        p4.metric("PDF duplicados", duplicate_pdf)
+        if extra_errors:
+            st.warning(
+                "Hay registros que requieren revisión: "
+                f"{extra_errors}. Revisa la columna ESTADO/DETALLE del control."
+            )
 
         if classified:
             pdf_zip = build_pdf_zip(classified, unmatched)
@@ -978,6 +1133,11 @@ if "result" in st.session_state:
             pdf_control.to_excel(
                 writer,
                 sheet_name="CONTROL_PDF",
+                index=False
+            )
+            pd.DataFrame([pdf_stats]).to_excel(
+                writer,
+                sheet_name="RESUMEN_PDF",
                 index=False
             )
 
@@ -1018,7 +1178,7 @@ if "result" in st.session_state:
     st.download_button(
         "⬇️ Descargar Excel organizado",
         data=data,
-        file_name="visitas_organizadas_V6.xlsx",
+        file_name="visitas_organizadas_por_paquetes.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
