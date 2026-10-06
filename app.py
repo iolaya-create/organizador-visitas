@@ -2,6 +2,7 @@ import io
 import re
 import zipfile
 import hashlib
+import html
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -891,6 +892,118 @@ def build_pdf_zip(classified, unmatched):
     return output.getvalue()
 
 
+def build_mymaps_files(result):
+    """
+    Genera archivos compatibles con Google My Maps a partir del resultado
+    de agrupamiento. El KML organiza los puntos en carpetas por paquete.
+    También genera KMZ y CSV para facilitar distintas formas de importación.
+    """
+    df = result.copy()
+
+    # Normalizar GPS sin alterar el DataFrame mostrado en pantalla.
+    lat = pd.to_numeric(df.get("LATITUD"), errors="coerce")
+    lon = pd.to_numeric(df.get("LONGITUD"), errors="coerce")
+    valid = df[lat.notna() & lon.notna()].copy()
+    valid["_LAT"] = lat[lat.notna() & lon.notna()].astype(float).values
+    valid["_LON"] = lon[lat.notna() & lon.notna()].astype(float).values
+
+    def esc(value):
+        if pd.isna(value):
+            return ""
+        return html.escape(str(value))
+
+    def text(value):
+        return "" if pd.isna(value) else str(value)
+
+    # KML: una carpeta por paquete y un punto por visita.
+    kml = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<kml xmlns="http://www.opengis.net/kml/2.2">',
+        '<Document>',
+        '<name>Organizador de Visitas - Paquetes GPS</name>',
+        '<description>Mapa generado por Organizador de Visitas. Cada carpeta corresponde a un paquete.</description>',
+    ]
+
+    pkg_numeric = pd.to_numeric(valid["PAQUETE"], errors="coerce")
+    valid = valid[pkg_numeric.notna()].copy()
+    valid["_PAQUETE_NUM"] = pkg_numeric[pkg_numeric.notna()].astype(int).values
+
+    for paquete in sorted(valid["_PAQUETE_NUM"].unique()):
+        grupo = valid[valid["_PAQUETE_NUM"] == paquete]
+        municipios = sorted(set(grupo["MUNICIPIO"].fillna("").astype(str)))
+        municipios = [m for m in municipios if m]
+        municipio_titulo = " / ".join(municipios) if municipios else "SIN_MUNICIPIO"
+
+        kml.append(
+            f'<Folder><name>PAQUETE {paquete:02d} - {esc(municipio_titulo)}</name>'
+        )
+
+        for _, row in grupo.iterrows():
+            solicitud = text(row.get("SOLICITUD", ""))
+            orden = text(row.get("ORDEN", ""))
+            municipio = text(row.get("MUNICIPIO", ""))
+            cuenta = text(row.get("CUENTA", ""))
+            direccion = text(row.get("DIRECCION", ""))
+            lat_value = float(row["_LAT"])
+            lon_value = float(row["_LON"])
+
+            nombre = f"#{orden} - SOL {solicitud}" if orden else f"SOL {solicitud}"
+            descripcion = (
+                f"<b>Paquete:</b> {esc(paquete):s}<br/>"
+                f"<b>Orden:</b> {esc(orden)}<br/>"
+                f"<b>Solicitud:</b> {esc(solicitud)}<br/>"
+                f"<b>Municipio:</b> {esc(municipio)}<br/>"
+                f"<b>Cuenta:</b> {esc(cuenta)}<br/>"
+                f"<b>Dirección:</b> {esc(direccion)}"
+            )
+
+            kml.append(
+                '<Placemark>'
+                f'<name>{esc(nombre)}</name>'
+                f'<description><![CDATA[{descripcion}]]></description>'
+                f'<Point><coordinates>{lon_value},{lat_value},0</coordinates></Point>'
+                '</Placemark>'
+            )
+
+        kml.append('</Folder>')
+
+    # Las visitas sin GPS quedan identificadas, pero sin punto geográfico.
+    missing = df[lat.isna() | lon.isna()]
+    if len(missing):
+        kml.append('<Folder><name>SIN COORDENADAS - REVISAR</name>')
+        for _, row in missing.iterrows():
+            solicitud = text(row.get("SOLICITUD", ""))
+            municipio = text(row.get("MUNICIPIO", ""))
+            kml.append(
+                '<Placemark>'
+                f'<name>SOL {esc(solicitud)}</name>'
+                f'<description>Municipio: {esc(municipio)}. Esta visita no tiene coordenadas GPS.</description>'
+                '</Placemark>'
+            )
+        kml.append('</Folder>')
+
+    kml.extend(['</Document>', '</kml>'])
+    kml_bytes = "\n".join(kml).encode("utf-8")
+
+    # KMZ es simplemente el KML comprimido en el formato estándar.
+    kmz_output = io.BytesIO()
+    with zipfile.ZipFile(kmz_output, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("doc.kml", kml_bytes)
+
+    # CSV plano: My Maps puede usar LATITUD/LONGITUD directamente.
+    csv_cols = [
+        c for c in [
+            "PAQUETE", "ORDEN", "SOLICITUD", "MUNICIPIO",
+            "DIRECCION", "CUENTA", "LATITUD", "LONGITUD"
+        ] if c in df.columns
+    ]
+    csv_bytes = df[csv_cols].to_csv(
+        index=False, encoding="utf-8-sig"
+    ).encode("utf-8-sig")
+
+    return kml_bytes, kmz_output.getvalue(), csv_bytes, len(valid), int(valid["_PAQUETE_NUM"].nunique()) if len(valid) else 0
+
+
 def excel_bytes(result, summary, control):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1181,6 +1294,47 @@ if "result" in st.session_state:
         file_name="visitas_organizadas_por_paquetes.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+    # ========================================================
+    # MAPA GPS — Google My Maps
+    # ========================================================
+    st.subheader("🗺️ Mapa GPS para Google My Maps")
+    st.caption(
+        "Genera un KML con una carpeta por paquete, un KMZ y un CSV. "
+        "Los puntos se construyen con las coordenadas ya validadas/corregidas por el aplicativo."
+    )
+
+    try:
+        kml_bytes, kmz_bytes, mymaps_csv, gps_count, map_package_count = build_mymaps_files(result)
+
+        m1, m2 = st.columns(2)
+        m1.metric("Puntos GPS", gps_count)
+        m2.metric("Paquetes en mapa", map_package_count)
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            st.download_button(
+                "🗺️ Descargar KML",
+                data=kml_bytes,
+                file_name="mapa_paquetes_MyMaps.kml",
+                mime="application/vnd.google-earth.kml+xml"
+            )
+        with b2:
+            st.download_button(
+                "📦 Descargar KMZ",
+                data=kmz_bytes,
+                file_name="mapa_paquetes_MyMaps.kmz",
+                mime="application/vnd.google-earth.kmz"
+            )
+        with b3:
+            st.download_button(
+                "📍 Descargar CSV",
+                data=mymaps_csv,
+                file_name="mapa_paquetes_MyMaps.csv",
+                mime="text/csv"
+            )
+    except Exception as e:
+        st.warning(f"No se pudo generar el archivo de mapa: {e}")
 
     st.subheader("Control")
     st.dataframe(control, use_container_width=True)
