@@ -508,15 +508,18 @@ def organize_visits(
 
 
 
-def extract_solicitud_from_pdf(pdf_bytes):
+def extract_solicitud_from_pdf(pdf_bytes, valid_solicitudes=None):
     """
-    Extrae el número de SOLICITUD de una orden PDF.
-    La llave oficial del cruce es SOLICITUD.
+    Extrae la SOLICITUD de una orden PDF.
+
+    Las SOLICITUD válidas del Excel son normalmente de 6 dígitos. Para evitar
+    capturar números de cuenta, identificación, teléfono, etc., se prioriza
+    cualquier número de 6 dígitos que aparezca inmediatamente después de
+    "Número solicitud". Si se entrega valid_solicitudes, se prefiere además
+    el candidato que exista realmente en el Excel.
     """
     text = ""
 
-    # pypdf es suficiente para las órdenes de texto; si no está disponible,
-    # el usuario recibe un mensaje claro en la interfaz.
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -532,22 +535,46 @@ def extract_solicitud_from_pdf(pdf_bytes):
             f"No se pudo leer el PDF: {type(e).__name__}: {e}"
         ) from e
 
-    # Primero buscamos expresamente "Número solicitud".
-    patterns = [
-        r"N[uú]mero\s+solicitud\s*[:\-]?\s*([0-9]{4,})",
-        r"N[uú]mero\s+de\s+solicitud\s*[:\-]?\s*([0-9]{4,})",
-        r"SOLICITUD\s*[:\-]?\s*([0-9]{4,})",
+    valid = {normalize_solicitud(x) for x in (valid_solicitudes or []) if normalize_solicitud(x)}
+
+    # 1) La fuente principal es el texto inmediatamente asociado al rótulo.
+    label_patterns = [
+        r"N[uú]mero\s+solicitud\s*[:\-]?",
+        r"N[uú]mero\s+de\s+solicitud\s*[:\-]?",
+        r"SOLICITUD\s*[:\-]?",
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return str(match.group(1)).strip(), text
+    for label_pattern in label_patterns:
+        for match in re.finditer(label_pattern, text, flags=re.IGNORECASE):
+            # Tomamos una ventana corta después del rótulo para no confundir
+            # la solicitud con números posteriores del formulario.
+            window = text[match.end():match.end() + 120]
+            candidates = re.findall(r"(?<!\d)(\d{6})(?!\d)", window)
 
-    # Como respaldo, intentar localizar el número en el nombre del archivo
-    # se hace fuera de esta función; aquí no se inventa ninguna solicitud.
+            # Si pypdf pegó números contiguos al campo, también probamos
+            # ventanas de 6 dígitos dentro de cadenas numéricas más largas.
+            if not candidates:
+                candidates = re.findall(r"\d{6}", window)
+
+            if valid:
+                for candidate in candidates:
+                    if normalize_solicitud(candidate) in valid:
+                        return normalize_solicitud(candidate), text
+
+            if candidates:
+                return normalize_solicitud(candidates[0]), text
+
+    # 2) Respaldo: buscar cualquier SOLICITUD de 6 dígitos que exista en Excel.
+    all_six = re.findall(r"(?<!\d)(\d{6})(?!\d)", text)
+    if valid:
+        for candidate in all_six:
+            if normalize_solicitud(candidate) in valid:
+                return normalize_solicitud(candidate), text
+
+    if all_six:
+        return normalize_solicitud(all_six[0]), text
+
     return None, text
-
 
 def normalize_solicitud(value):
     """
@@ -581,6 +608,8 @@ def organize_pdfs(uploaded_pdfs, result):
         if key:
             lookup.setdefault(key, []).append(row)
 
+    valid_solicitudes = set(lookup.keys())
+
     records = []
     classified = []
     unmatched = []
@@ -591,7 +620,7 @@ def organize_pdfs(uploaded_pdfs, result):
         filename = pdf_file.name
 
         try:
-            solicitud, _ = extract_solicitud_from_pdf(pdf_bytes)
+            solicitud, _ = extract_solicitud_from_pdf(pdf_bytes, valid_solicitudes)
         except Exception as e:
             records.append({
                 "PDF": filename,
@@ -773,7 +802,7 @@ def excel_bytes(result, summary, control):
 # INTERFAZ
 # ============================================================
 
-st.title("📍 Organizador de Visitas — V6")
+st.title("📍 Organizador de Visitas — V11")
 
 st.write(
     "Carga un Excel y el aplicativo organizará las visitas por proximidad "
